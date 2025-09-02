@@ -14,6 +14,8 @@ typedef enum { LOG_ERROR = 0, LOG_WARN = 1, LOG_INFO = 2, LOG_DEBUG = 3 } LogLev
 
 static LogLevel g_log_level = LOG_ERROR;
 static char g_nicks[FD_SETSIZE][64];
+static int g_afk[FD_SETSIZE];
+static char g_afk_reason[FD_SETSIZE][128];
 
 static const char* level_to_string(LogLevel level) {
     return (level == LOG_ERROR) ? "ERROR" : (level == LOG_WARN) ? "WARN" : (level == LOG_INFO) ? "INFO" : "DEBUG";
@@ -118,6 +120,7 @@ int main(int argc, char **argv) {
     fd_max = server_socket_fd > STDIN_FILENO ? server_socket_fd : STDIN_FILENO;
 
     for (int i = 0; i < FD_SETSIZE; i++) client_fds[i] = -1;
+    for (int i = 0; i < FD_SETSIZE; i++) { g_nicks[i][0] = '\0'; g_afk[i] = 0; g_afk_reason[i][0] = '\0'; }
 
     while (1) {
         ready_fds = read_fds;
@@ -204,7 +207,7 @@ int main(int argc, char **argv) {
 
                 close(i);
                 FD_CLR(i, &read_fds);
-                for (int k = 0; k < FD_SETSIZE; k++) if (client_fds[k] == i) client_fds[k] = -1;
+                for (int k = 0; k < FD_SETSIZE; k++) if (client_fds[k] == i) { client_fds[k] = -1; g_nicks[k][0] = '\0'; g_afk[k] = 0; g_afk_reason[k][0] = '\0'; }
                 continue;
             }
 
@@ -237,6 +240,8 @@ int main(int argc, char **argv) {
                     "/nick <name>         - Set your nickname\n"
                     "/who                 - List connected users\n"
                     "/me <action>         - Emote, e.g. \/me waves\n"
+                    "/afk [reason]        - Mark yourself AFK with optional reason\n"
+                    "/back                - Clear AFK status\n"
                     "/ping                - Ping the server\n"
                     "/debug <level>       - Set log level (ERROR|WARN|INFO|DEBUG)\n"
                     "/quit                - Disconnect";
@@ -253,6 +258,10 @@ int main(int argc, char **argv) {
                         char line[256];
                         if (g_nicks[k][0]) snprintf(line, sizeof(line), " - %s", g_nicks[k]);
                         else snprintf(line, sizeof(line), " - Client %d", client_fds[k]);
+                        if (g_afk[k]) {
+                            size_t len = strlen(line);
+                            snprintf(line + len, sizeof(line) - len, " (AFK%s%s)", g_afk_reason[k][0] ? ": " : "", g_afk_reason[k]);
+                        }
                         send_crlf(i, line);
                     }
                 }
@@ -273,6 +282,40 @@ int main(int argc, char **argv) {
                 for (int k = 0; k < FD_SETSIZE; k++) {
                     int fd = client_fds[k];
                     if (fd != -1 && fd != i) send_crlf(fd, msg);
+                }
+                continue;
+            }
+
+            if (strncmp(buffer, "/afk", 4) == 0) {
+                // optional reason after space
+                const char *reason = NULL;
+                if (buffer[4] == ' ') reason = buffer + 5; // skip space
+                char local_reason[128];
+                if (reason) {
+                    strncpy(local_reason, reason, sizeof(local_reason) - 1);
+                    local_reason[sizeof(local_reason) - 1] = '\0';
+                    int Lr = (int)strlen(local_reason);
+                    while (Lr > 0 && (local_reason[Lr-1] == '\n' || local_reason[Lr-1] == '\r')) { local_reason[--Lr] = '\0'; }
+                } else {
+                    local_reason[0] = '\0';
+                }
+                if (sender_index >= 0) {
+                    g_afk[sender_index] = 1;
+                    strncpy(g_afk_reason[sender_index], local_reason, sizeof(g_afk_reason[sender_index]) - 1);
+                    g_afk_reason[sender_index][sizeof(g_afk_reason[sender_index]) - 1] = '\0';
+                    char ack[256];
+                    if (local_reason[0]) snprintf(ack, sizeof(ack), "*[System] You are now AFK: %s*", local_reason);
+                    else snprintf(ack, sizeof(ack), "*[System] You are now AFK*");
+                    send_crlf(i, ack);
+                }
+                continue;
+            }
+
+            if (strncmp(buffer, "/back", 5) == 0) {
+                if (sender_index >= 0) {
+                    g_afk[sender_index] = 0;
+                    g_afk_reason[sender_index][0] = '\0';
+                    send_crlf(i, "*[System] You are no longer AFK*");
                 }
                 continue;
             }
@@ -320,6 +363,20 @@ int main(int argc, char **argv) {
             else snprintf(namebuf, sizeof(namebuf), "Client %d", i);
 
             log_msg(LOG_INFO, "%s: %s", namebuf, buffer);
+
+            // If message mentions any AFK user by exact nickname, notify sender locally
+            if (sender_index >= 0) {
+                for (int k = 0; k < FD_SETSIZE; k++) {
+                    if (client_fds[k] != -1 && g_nicks[k][0] && g_afk[k]) {
+                        if (strstr(buffer, g_nicks[k]) != NULL) {
+                            char note[256];
+                            if (g_afk_reason[k][0]) snprintf(note, sizeof(note), "*[System] %s is AFK: %s*", g_nicks[k], g_afk_reason[k]);
+                            else snprintf(note, sizeof(note), "*[System] %s is AFK*", g_nicks[k]);
+                            send_crlf(i, note);
+                        }
+                    }
+                }
+            }
 
             char out[512];
             snprintf(out, sizeof(out), "%s: %s", namebuf, buffer);
